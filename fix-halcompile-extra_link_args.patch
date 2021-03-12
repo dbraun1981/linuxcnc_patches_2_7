@@ -1,0 +1,18 @@
+diff -Naur linuxcnc.orig/src/hal/utils/halcompile.g linuxcnc/src/hal/utils/halcompile.g
+--- linuxcnc.orig/src/hal/utils/halcompile.g	2020-01-02 20:02:01.000000000 +0100
++++ linuxcnc/src/hal/utils/halcompile.g	2020-01-17 10:02:22.079057162 +0100
+@@ -83,12 +83,14 @@
+                 | "true" {{ return 1 }} | "false" {{ return 0 }}  
+                 | "TRUE" {{ return 1 }} | "FALSE" {{ return 0 }}  
+                 | NAME {{ return NAME }}
++                | STRING {{ return STRING.replace('"', '') }}
+                 | FPNUMBER {{ return float(FPNUMBER.rstrip("f")) }}
+                 | NUMBER {{ return int(NUMBER,0) }}
+     rule SValue: "yes" {{ return "yes" }} | "no" {{ return "no" }}  
+                 | "true" {{ return "true" }} | "false" {{ return "false" }}  
+                 | "TRUE" {{ return "TRUE" }} | "FALSE" {{ return "FALSE" }}  
+                 | NAME {{ return NAME }}
++                | STRING {{ return STRING.replace('"', '') }}
+                 | FPNUMBER {{ return FPNUMBER }}
+                 | NUMBER {{ return NUMBER }}
+     rule OptValue: Value {{ return Value }}

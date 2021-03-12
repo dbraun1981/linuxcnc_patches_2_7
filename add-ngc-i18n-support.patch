@@ -1,0 +1,428 @@
+diff -Naur linuxcnc.orig/debian/control.in linuxcnc/debian/control.in
+--- linuxcnc.orig/debian/control.in	2020-01-02 20:02:01.000000000 +0100
++++ linuxcnc/debian/control.in	2020-01-17 10:02:25.131089233 +0100
+@@ -12,7 +12,7 @@
+     libglu1-mesa-dev, libgl1-mesa-dev | libgl1-mesa-swx11-dev,
+     libgtk2.0-dev, gettext, autoconf, libboost-python-dev,
+     texlive-lang-cyrillic, texlive-lang-french,
+-    texlive-lang-spanish, texlive-lang-german, netcat,
++    texlive-lang-spanish, texlive-lang-german, netcat, libpcre3-dev,
+     libmodbus-dev (>= 3.0), libusb-1.0-0-dev, procps, psmisc,
+     graphviz, inkscape,
+     intltool,
+@@ -55,7 +55,7 @@
+     python-vte,
+     @PYTHON_GST@,
+     python-xlib, python-gtkglext1, python-configobj,
+-    tclreadline, procps, psmisc, module-init-tools | kmod, tclx,
++    tclreadline, procps, psmisc, libpcre3, module-init-tools | kmod, tclx,
+     mesa-utils, blt
+ Description: motion controller for CNC machines and robots
+  LinuxCNC is the next-generation Enhanced Machine Controller which
+diff -Naur linuxcnc.orig/src/emc/rs274ngc/interp_convert.cc linuxcnc/src/emc/rs274ngc/interp_convert.cc
+--- linuxcnc.orig/src/emc/rs274ngc/interp_convert.cc	2020-01-17 10:02:20.039035687 +0100
++++ linuxcnc/src/emc/rs274ngc/interp_convert.cc	2020-01-17 10:02:25.131089233 +0100
+@@ -1395,7 +1395,8 @@
+ 
+   // compare with MSG, SYSTEM, DEBUG, PRINT
+   if (startswith(lc, MSG_STR)) {
+-    MESSAGE(comment + start + strlen(MSG_STR));
++    i18n_translate(comment + start + strlen(MSG_STR), expanded, EX_SIZE);
++    MESSAGE(expanded);
+     return INTERP_OK;
+   }
+   else if (startswith(lc, DEBUG_STR))
+diff -Naur linuxcnc.orig/src/emc/rs274ngc/interp_i18n.cc linuxcnc/src/emc/rs274ngc/interp_i18n.cc
+--- linuxcnc.orig/src/emc/rs274ngc/interp_i18n.cc	1970-01-01 01:00:00.000000000 +0100
++++ linuxcnc/src/emc/rs274ngc/interp_i18n.cc	2020-01-17 10:02:25.131089233 +0100
+@@ -0,0 +1,143 @@
++/********************************************************************
++ * Description: interp_i18n.cc
++ *
++ *  message internationalization support
++ *
++ * Author: Sascha Ittner
++ * License: GPL Version 2
++ * System: Linux
++ *
++ * Copyright (c) 2015 All rights reserved.
++ *
++ ********************************************************************/
++
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
++#include "rs274ngc.hh"
++#include "rs274ngc_interp.hh"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <pcre.h>
++#include <string.h>
++
++void Interp::i18n_init() {
++  const char *errmsg;
++  int errpos;
++
++  i18n_cleanup();
++
++  const char *lang = getenv("LANG");
++  if (lang != NULL) {
++    char *p;
++    char lpart[PATH_MAX+1];
++    strncpy(lpart, lang, sizeof(lpart));
++    lpart[sizeof(lpart) - 1] = 0;
++    if ((p = strchr(lpart, '.')) != NULL) *p = 0;
++    if ((p = strchr(lpart, '_')) != NULL) *p = 0;
++
++    char fname[PATH_MAX+1];
++    snprintf(fname, sizeof(fname), "lang.%s", lpart);
++    fname[sizeof(lpart) - 1] = 0;
++
++    FILE *fp = find_file(&_setup, fname);
++    if (fp != NULL) {
++      pcre *re = pcre_compile("(?:[^\\s\"]+|\\\"[^\"]*\\\")", 0, &errmsg, &errpos, 0);
++      if (re != NULL) {
++        char *line = NULL;
++        size_t len = 0;
++        ssize_t read;
++        while ((read = getline(&line, &len, fp)) != -1) {
++          int pos = 0;
++          char *from, *to;
++          if (!(from = i18n_map_token(re, line, read, &pos))) {
++            continue;
++          }
++          if (!(to = i18n_map_token(re, line, read, &pos))) {
++            continue;
++          }
++
++          i18n_map[std::string(from)] = std::string(to);
++        }
++        free(line);
++        free(re);
++      }
++      fclose(fp);
++    }
++  }
++
++  i18n_re = pcre_compile("_{[^}]*}", 0, &errmsg, &errpos, 0);
++}
++
++void Interp::i18n_cleanup() {
++  free(i18n_re);
++  i18n_re = NULL;
++  i18n_map.clear();
++}
++
++char *Interp::i18n_map_token(const pcre *code, char *subject, int length, int *offset) {
++  int vect[3];
++  char *start;
++  char *end;
++
++  if (*offset >= length) {
++    return NULL;
++  }
++
++  if (pcre_exec(code, NULL, subject, length, *offset, 0, vect, 3) <= 0) {
++    return NULL;
++  }
++
++  start = subject + vect[0];
++  end = subject + vect[1];
++
++  while (end > start && *(end - 1) == '"') end--;
++  *end = 0;
++  while (*start == '"') start++;
++
++  *offset = vect[1] + 1;
++  return start;
++}
++
++int Interp::i18n_translate(const char *from, char *to, int to_len) {
++  int from_len = strlen(from);
++  int offset = 0;
++  int vect[3];
++  std::string res;
++
++  while (*from == ' ') from++;
++
++  if (i18n_re == NULL) {
++    strncpy(to, from, to_len);
++    to[to_len - 1] = 0;
++    return from_len;
++  }
++
++  while (offset < from_len && pcre_exec(i18n_re, NULL, from, from_len, offset, 0, vect, 3) > 0) {
++    if (vect[0] > offset) {
++      res.append(from + offset, vect[0] - offset);
++    }
++
++    std::string tok(from + vect[0] + 2, vect[1] - vect[0] - 3);
++    if (i18n_map.find(tok) != i18n_map.end()) {
++      res.append(i18n_map[tok]);
++    } else {
++      if (tok.c_str()[0] != '_') {
++        res.append(tok);
++      }
++    }
++
++    offset = vect[1];
++  }
++
++  if (offset < from_len) {
++    res.append(from + offset, from_len - offset);
++  }
++
++  strncpy(to, res.c_str(), to_len);
++  to[to_len - 1] = 0;
++
++  return res.length();
++}
++
+diff -Naur linuxcnc.orig/src/emc/rs274ngc/interp_internal.hh linuxcnc/src/emc/rs274ngc/interp_internal.hh
+--- linuxcnc.orig/src/emc/rs274ngc/interp_internal.hh	2020-01-17 10:02:20.039035687 +0100
++++ linuxcnc/src/emc/rs274ngc/interp_internal.hh	2020-01-17 10:02:25.131089233 +0100
+@@ -19,8 +19,10 @@
+ #include "config.h"
+ #include <limits.h>
+ #include <stdio.h>
++#include <pcre.h>
+ #include <set>
+ #include <map>
++#include <string>
+ #include <bitset>
+ #include "canon.hh"
+ #include "emcpos.h"
+diff -Naur linuxcnc.orig/src/emc/rs274ngc/rs274ngc_interp.hh linuxcnc/src/emc/rs274ngc/rs274ngc_interp.hh
+--- linuxcnc.orig/src/emc/rs274ngc/rs274ngc_interp.hh	2020-01-02 20:02:01.000000000 +0100
++++ linuxcnc/src/emc/rs274ngc/rs274ngc_interp.hh	2020-01-17 10:02:25.131089233 +0100
+@@ -638,6 +638,7 @@
+     int py_execute(const char *cmd, bool as_file = false); // for (py, ....) comments
+     int py_reload();
+     FILE *find_ngc_file(setup_pointer settings,const char *basename, char *foundhere = NULL);
++    FILE *find_file(setup_pointer settings,char *filename, char *foundhere = NULL);
+ 
+     const char *getSavedError();
+     // set error message text without going through printf format interpretation
+@@ -659,6 +660,15 @@
+ 
+  FILE *log_file;
+ 
++ // internationalization stuff
++ pcre *i18n_re;
++ std::map<std::string, std::string> i18n_map;
++
++ void i18n_init();
++ void i18n_cleanup();
++ int i18n_translate(const char *from, char *to, int to_len);
++ char *i18n_map_token(const pcre *code, char *subject, int length, int *offset);
++
+ /* Internal arrays */
+  static const int _gees[];
+  static const int _ems[];
+diff -Naur linuxcnc.orig/src/emc/rs274ngc/rs274ngc_pre.cc linuxcnc/src/emc/rs274ngc/rs274ngc_pre.cc
+--- linuxcnc.orig/src/emc/rs274ngc/rs274ngc_pre.cc	2020-01-17 10:02:20.039035687 +0100
++++ linuxcnc/src/emc/rs274ngc/rs274ngc_pre.cc	2020-01-17 10:02:25.131089233 +0100
+@@ -115,6 +115,7 @@
+ {
+     _setup.init_once = 1;  
+     init_named_parameters();  // need this before Python init.
++    i18n_re = NULL;
+  
+     if (!PythonPlugin::instantiate(builtin_modules)) {  // factory
+ 	Error("Interp ctor: cant instantiate Python plugin");
+@@ -165,6 +166,7 @@
+             fclose(log_file);
+ 	log_file = 0;
+     }
++    i18n_cleanup();
+ }
+ 
+ void Interp::doLog(unsigned int flags, const char *file, int line,
+@@ -1221,6 +1223,8 @@
+   }
+   _setup.init_once = 0;
+   
++  i18n_init();
++
+   return INTERP_OK;
+ }
+ 
+@@ -2472,20 +2476,25 @@
+ // config file parsing (REMAP... ngc=<basename>)
+ FILE *Interp::find_ngc_file(setup_pointer settings,const char *basename, char *foundhere )
+ {
+-    FILE *newFP;
+     char tmpFileName[PATH_MAX+1];
+-    char newFileName[PATH_MAX+1];
+-    char foundPlace[PATH_MAX+1];
+-    int  dct;
+ 
+     // look for a new file
+     sprintf(tmpFileName, "%s.ngc", basename);
++    return find_file(settings, tmpFileName, foundhere);
++}
++
++FILE *Interp::find_file(setup_pointer settings,char *filename, char *foundhere )
++{
++    FILE *newFP;
++    char newFileName[PATH_MAX+1];
++    char foundPlace[PATH_MAX+1];
++    int  dct;
+ 
+     // find subroutine by search: program_prefix, subroutines, wizard_root
+     // use first file found
+ 
+     // first look in the program_prefix place
+-    sprintf(newFileName, "%s/%s", settings->program_prefix, tmpFileName);
++    sprintf(newFileName, "%s/%s", settings->program_prefix, filename);
+     newFP = fopen(newFileName, "r");
+ 
+     // then look in the subroutines place
+@@ -2493,7 +2502,7 @@
+ 	for (dct = 0; dct < MAX_SUB_DIRS; dct++) {
+ 	    if (!settings->subroutines[dct])
+ 		continue;
+-	    sprintf(newFileName, "%s/%s", settings->subroutines[dct], tmpFileName);
++	    sprintf(newFileName, "%s/%s", settings->subroutines[dct], filename);
+ 	    newFP = fopen(newFileName, "r");
+ 	    if (newFP) {
+ 		// logOword("fopen: |%s|", newFileName);
+@@ -2504,12 +2513,12 @@
+     // if not found, search the wizard tree
+     if (!newFP) {
+ 	int ret;
+-	ret = findFile(settings->wizard_root, tmpFileName, foundPlace);
++	ret = findFile(settings->wizard_root, filename, foundPlace);
+ 
+ 	if (INTERP_OK == ret) {
+ 	    // create the long name
+ 	    sprintf(newFileName, "%s/%s",
+-		    foundPlace, tmpFileName);
++		    foundPlace, filename);
+ 	    newFP = fopen(newFileName, "r");
+ 	}
+     }
+diff -Naur linuxcnc.orig/src/emc/rs274ngc/Submakefile linuxcnc/src/emc/rs274ngc/Submakefile
+--- linuxcnc.orig/src/emc/rs274ngc/Submakefile	2020-01-02 20:02:01.000000000 +0100
++++ linuxcnc/src/emc/rs274ngc/Submakefile	2020-01-17 10:02:25.131089233 +0100
+@@ -13,6 +13,7 @@
+ 	interp_cycles.cc \
+ 	interp_execute.cc \
+ 	interp_find.cc \
++	interp_i18n.cc \
+ 	interp_internal.cc \
+ 	interp_inverse.cc \
+ 	interp_read.cc \
+@@ -42,7 +43,7 @@
+ 	$(ECHO) Linking $(notdir $@)
+ 	@mkdir -p ../lib
+ 	@rm -f $@
+-	$(CXX) -g $(LDFLAGS) -Wl,-soname,$(notdir $@) -shared -o $@ $^ -lstdc++ $(BOOST_PYTHON_LIBS) -l$(LIBPYTHON) -ldl
++	$(CXX) -g $(LDFLAGS) -Wl,-soname,$(notdir $@) -shared -o $@ $^ -lstdc++ $(BOOST_PYTHON_LIBS) -l$(LIBPYTHON) -ldl -lpcre
+ 
+ $(patsubst ./emc/rs274ngc/%,../include/%,$(wildcard ./emc/rs274ngc/*.h)): ../include/%.h: ./emc/rs274ngc/%.h
+ 	cp $^ $@
+diff -Naur linuxcnc.orig/tcl/ngcgui.tcl linuxcnc/tcl/ngcgui.tcl
+--- linuxcnc.orig/tcl/ngcgui.tcl	2020-01-17 10:02:24.103078438 +0100
++++ linuxcnc/tcl/ngcgui.tcl	2020-01-17 10:02:25.131089233 +0100
+@@ -425,6 +425,61 @@
+   proc _ {s} {return [::msgcat::mc $s]}
+ }
+ 
++proc ::ngcgui::i18n_init {} {
++  # check if already initialized
++  if [info exists ::ngc(any,i18n,initialized)] { return }
++  set ::ngc(any,i18n,initialized) ""
++
++  # extract lang part from LANG env variable
++  if ![info exists ::env(LANG)] { return }
++  set lang [split $::env(LANG) "."]
++  if { [llength $lang] == 0 } { return }
++  set lang [split [lindex $lang 0] "_"]
++  if { [llength $lang] == 0 } { return }
++  set lang [lindex $lang 0]
++  if { "$lang" == "" } { return }
++
++  # search language file
++  set fname ""
++  foreach path $::ngc(any,paths) {
++    set tmp "$path/lang.$lang"
++    if [file exists $tmp] {
++      set fname $tmp
++      break
++    }
++  }
++  if { "$fname" == "" } { return }
++
++  ## create expression map
++  set fp [open $fname r]
++  while { [gets $fp line] >= 0 } {
++     set tok [regexp -all -inline {(?:[^\s"]+|\"[^"]*\")} $line]
++     if { [llength $tok] >= 2 } { 
++       set from [string trim [lindex $tok 0] "\""]
++       set to [string trim [lindex $tok 1] "\""]
++       set ::ngc(any,i18n,$from) $to
++     }
++  }
++  close $fp
++}
++
++proc ::ngcgui::i18n_translate {comment} {
++  foreach {tok} [lsort -unique [regexp -all -inline {_\{[^\}]*\}} $comment]] {
++    set from [string range $tok 2 [expr [string length $tok] - 2]]
++    set to ""
++    if [info exists ::ngc(any,i18n,$from)] {
++      set to $::ngc(any,i18n,$from)
++    } else {
++      if ![string match "_*" $from] {
++        set to $from
++      }
++    }
++    set comment [string map [list $tok $to] $comment]
++  }
++
++  return $comment
++}
++
+ #-----------------------------------------------------------------------
+ proc ::ngcgui::parse_ngc {hdl ay_name filename args} {
+   # return 1 for ok
+@@ -494,7 +549,7 @@
+       if {[string first "(info:"  $theline] >= 0} {
+         set idx [string first : $theline]
+         set info [string range $theline [expr $idx +1] end]
+-        set ay($hdl,info) [string trim $info " )"]
++        set ay($hdl,info) [i18n_translate [string trim $info " )"]]
+       }
+     }
+ 
+@@ -693,9 +748,9 @@
+           if [regexp -nocase "= *(\\+*-*\[0-9.\]*)(.*)" \
+                  $cmt V(match) V(dvalue) V(comment)] {
+             set ay($hdl,arg,dvalue,$num02)  $V(dvalue)
+-            set ay($hdl,arg,comment,$num02) [string trim $V(comment)]
++            set ay($hdl,arg,comment,$num02) [i18n_translate [string trim $V(comment)]]
+           } else {
+-            set ay($hdl,arg,comment,$num02) $cmt
++            set ay($hdl,arg,comment,$num02) [i18n_translate $cmt]
+           }
+         }
+ 
+@@ -982,7 +1037,7 @@
+ 
+ proc ::ngcgui::initgui {hdl} {
+   if ![info exists ::ngc(embed,hdl)] {set ::ngc(embed,hdl) 0}
+-  if [info exists ::ngcgui($hdl,afterid)] { return ;# already done }
++  if [info exists ::ngc($hdl,afterid)] { return ;# already done }
+   # number of entries in positional frame 30 max positional parameters
+   # 3 frames max so must have pentries >=10
+   if ![info exists ::ngc(any,pentries)] {set ::ngc(any,pentries) 10}
+@@ -1072,6 +1127,7 @@
+     }
+     create {
+       if {"$hdl" == ""} {return -code error "hdl is null"}
++      i18n_init
+       # mandatory arg for mode==create is a frame
+       # caller packs/unpacks wframe which must be a valid name
+       # but not exist yet

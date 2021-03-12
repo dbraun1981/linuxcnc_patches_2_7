@@ -1,0 +1,19 @@
+diff -Naur linuxcnc.orig/src/emc/usr_intf/axis/scripts/axis.py linuxcnc/src/emc/usr_intf/axis/scripts/axis.py
+--- linuxcnc.orig/src/emc/usr_intf/axis/scripts/axis.py	2020-01-17 10:02:17.963013801 +0100
++++ linuxcnc/src/emc/usr_intf/axis/scripts/axis.py	2020-01-17 10:02:18.499019454 +0100
+@@ -781,6 +781,7 @@
+         vupdate(vars.interp_state, self.stat.interp_state)
+         vupdate(vars.queued_mdi_commands, self.stat.queued_mdi_commands)
+         if hal_present == 1 :
++            comp["is-running"] = 1
+             notifications_clear = comp["notifications-clear"]
+             if self.notifications_clear != notifications_clear:
+                  self.notifications_clear = notifications_clear
+@@ -3385,6 +3386,7 @@
+ 
+ if hal_present == 1 :
+     comp = hal.component("axisui")
++    comp.newpin("is-running", hal.HAL_BIT, hal.HAL_OUT)
+     comp.newpin("jog.x", hal.HAL_BIT, hal.HAL_OUT)
+     comp.newpin("jog.y", hal.HAL_BIT, hal.HAL_OUT)
+     comp.newpin("jog.z", hal.HAL_BIT, hal.HAL_OUT)

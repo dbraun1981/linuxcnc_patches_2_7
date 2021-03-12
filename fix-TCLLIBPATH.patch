@@ -1,0 +1,16 @@
+diff -Naur linuxcnc.orig/scripts/linuxcnc.in linuxcnc/scripts/linuxcnc.in
+--- linuxcnc.orig/scripts/linuxcnc.in	2020-01-02 20:02:01.000000000 +0100
++++ linuxcnc/scripts/linuxcnc.in	2020-01-17 10:02:21.587051985 +0100
+@@ -69,6 +69,12 @@
+ 
+ PRELOAD_WORKAROUND=@PRELOAD_WORKAROUND@
+ 
++if [ -z "$TCLLIBPATH" ]; then
++    TCLLIBPATH=$LINUXCNC_HOME/tcl
++else
++    TCLLIBPATH=$LINUXCNC_HOME/tcl:$TCLLIBPATH
++fi
++export TCLLIBPATH
+ 
+ XFILESEARCHPATH=%D:@EMC2_HOME@/%T/%N%C:@EMC2_HOME@/%T/%N
+ export XFILESEARCHPATH

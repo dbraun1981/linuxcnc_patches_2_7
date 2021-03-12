@@ -1,0 +1,12 @@
+diff -Naur linuxcnc.orig/src/hal/user_comps/hal_input.py linuxcnc/src/hal/user_comps/hal_input.py
+--- linuxcnc.orig/src/hal/user_comps/hal_input.py	2020-01-02 20:02:01.000000000 +0100
++++ linuxcnc/src/hal/user_comps/hal_input.py	2020-01-17 10:02:19.547030503 +0100
+@@ -195,7 +195,7 @@
+         parts = f[1:]
+     else:
+         try:
+-            d.append(HalInputDevice(w, i, f, parts))
++            d.append(HalInputDevice(w, i, f.replace('"',''), parts))
+         except LookupError, detail:
+             raise SystemExit, detail
+         parts = 'KRAL'

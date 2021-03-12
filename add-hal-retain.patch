@@ -1,0 +1,892 @@
+diff -Naur linuxcnc.orig/scripts/linuxcnc.in linuxcnc/scripts/linuxcnc.in
+--- linuxcnc.orig/scripts/linuxcnc.in	2020-01-17 10:02:21.587051985 +0100
++++ linuxcnc/scripts/linuxcnc.in	2020-01-17 10:02:27.683116000 +0100
+@@ -842,6 +842,30 @@
+     HALCOMMAND=`$INIVAR -ini "$INIFILE" -var HALCMD -sec HAL -num $NUM 2> /dev/null`
+ done
+ 
++# 4.3.7.1 load retain stuff if retained signals are found
++if $HALCMD list retain | grep -q '.'; then
++    echo "Loading retain"
++
++    # load realtime part for syncing
++    $HALCMD loadrt retain
++    RETAIN_SYNC_THREAD=`$INIVAR -ini "$INIFILE" -var SYNC_THREAD -sec RETAIN 2> /dev/null`
++    if [ -z "$RETAIN_VAR_FILE" ]; then
++	RETAIN_SYNC_THREAD="servo-thread"
++    fi
++    $HALCMD addf retain.sync $RETAIN_SYNC_THREAD
++
++    # load user space part for file I/O
++    RETAIN_VAR_FILE=`$INIVAR -ini "$INIFILE" -var VAR_FILE -sec RETAIN 2> /dev/null`
++    if [ -z "$RETAIN_VAR_FILE" ]; then
++	RETAIN_VAR_FILE="retain.var"
++    fi
++    if [ ! "${CFGFILE:0:1}" = "/" ] ; then
++	RETAIN_VAR_FILE="$(dirname $INIFILE)/$RETAIN_VAR_FILE"
++    fi
++    RETAIN_POLL_PERIOD=`$INIVAR -ini "$INIFILE" -var POLL_PERIOD -sec RETAIN 2> /dev/null`
++    $HALCMD loadusr -W retain_usr "$RETAIN_VAR_FILE" "$RETAIN_POLL_PERIOD"
++fi
++
+ # 4.3.8. start the realtime stuff ticking
+ $HALCMD start
+ 
+diff -Naur linuxcnc.orig/src/hal/components/retain.c linuxcnc/src/hal/components/retain.c
+--- linuxcnc.orig/src/hal/components/retain.c	1970-01-01 01:00:00.000000000 +0100
++++ linuxcnc/src/hal/components/retain.c	2020-01-17 10:02:27.683116000 +0100
+@@ -0,0 +1,136 @@
++#include "rtapi.h"
++#include "rtapi_app.h"
++#include "hal.h"
++#include "../hal_priv.h"
++
++#include "retain.h"
++
++/* module information */
++MODULE_AUTHOR("Sascha Ittner");
++MODULE_DESCRIPTION("Retain component for LinuxCNC HAL signals (RT-part)");
++MODULE_LICENSE("GPL");
++
++#define COMPNAME "retain"
++
++typedef struct {
++    hal_u32_t action;
++} hal_retain_t;
++
++static int comp_id;
++
++static void sync(void *arg, long period);
++static int sync_read(void);
++
++int rtapi_app_main(void) {
++  hal_retain_t *hal;
++
++  comp_id = hal_init(COMPNAME);
++  if (comp_id < 0) {
++    rtapi_print_msg(RTAPI_MSG_ERR, COMPNAME ": ERROR: hal_init() failed\n");
++    goto fail0;
++  }
++
++  hal = hal_malloc(sizeof(hal_retain_t));
++  if (hal == NULL) {
++    rtapi_print_msg(RTAPI_MSG_ERR, COMPNAME ": ERROR: hal_malloc() failed\n");
++    goto fail1;
++  }
++
++  if (hal_param_u32_new(RETAIN_ACTION_PARAM, HAL_RW, &(hal->action), comp_id)) {
++    rtapi_print_msg(RTAPI_MSG_ERR, COMPNAME ": ERROR: export of param " RETAIN_ACTION_PARAM " failed\n");
++    goto fail1;
++  }
++  if (hal_export_funct(COMPNAME ".sync", sync, hal, 1, 0, comp_id)) {
++    rtapi_print_msg(RTAPI_MSG_ERR, COMPNAME ": ERROR: export of function " COMPNAME ".sync failed\n");
++    goto fail1;
++  }
++
++  hal->action = 0;
++
++  hal_ready(comp_id);
++  return 0;
++
++fail1:
++  hal_exit(comp_id);
++fail0:
++  return -1;
++}
++
++void rtapi_app_exit(void)
++{
++  hal_exit(comp_id);
++}
++
++static void sync(void *arg, long period) {
++  hal_retain_t *hal = (hal_retain_t *) arg;
++  int ret;
++
++  // check for read
++  if (hal->action == RETAIN_ACTION_READ) {
++    ret = sync_read();
++    if (ret >= 0) {
++      // trigger store action if data has changed
++      hal->action = (ret > 0) ? RETAIN_ACTION_STORE : RETAIN_ACTION_NOOP;
++    }
++  }
++}
++
++static int sync_read(void) {
++  int changed = 0;
++  int next;
++  hal_sig_t *sig;
++  void *data_addr;
++  hal_data_t *hd = (hal_data_t *) hal_shmem_base;
++
++  // try to get mutex
++  if (rtapi_mutex_try(&(hd->mutex))) {
++    return -1;
++  }
++
++  next = hd->sig_list_ptr;
++  while (next != 0) {
++    sig = SHMPTR(next);
++    next = sig->next_ptr;
++    data_addr = SHMPTR(sig->data_ptr);
++
++    // compare retain signals only
++    if ((sig->flags & HAL_SIGFLAG_RETAIN) == 0) {
++      continue;
++    }
++
++    switch (sig->type) {
++      case HAL_BIT:
++        if (sig->retain_val.bit != *((hal_bit_t *) data_addr)) {
++          changed = 1;
++          sig->retain_val.bit = *((hal_bit_t *) data_addr);
++        }
++        break;
++      case HAL_U32:
++        if (sig->retain_val.u32 != *((hal_u32_t *) data_addr)) {
++          changed = 1;
++          sig->retain_val.u32 = *((hal_u32_t *) data_addr);
++        }
++        break;
++      case HAL_S32:
++        if (sig->retain_val.s32 != *((hal_s32_t *) data_addr)) {
++          changed = 1;
++          sig->retain_val.s32 = *((hal_s32_t *) data_addr);
++        }
++        break;
++      case HAL_FLOAT:
++        if (sig->retain_val.flt != *((hal_float_t *) data_addr)) {
++          changed = 1;
++          sig->retain_val.flt = *((hal_float_t *) data_addr);
++        }
++        break;
++      default:
++        break;
++    }
++  }
++
++  // release mutex
++  rtapi_mutex_give(&(hd->mutex));
++
++  return changed;
++}
++
+diff -Naur linuxcnc.orig/src/hal/components/retain.h linuxcnc/src/hal/components/retain.h
+--- linuxcnc.orig/src/hal/components/retain.h	1970-01-01 01:00:00.000000000 +0100
++++ linuxcnc/src/hal/components/retain.h	2020-01-17 10:02:27.683116000 +0100
+@@ -0,0 +1,6 @@
++#define RETAIN_ACTION_PARAM "retain.action"
++
++#define RETAIN_ACTION_NOOP 0
++#define RETAIN_ACTION_READ 1
++#define RETAIN_ACTION_STORE 2
++
+diff -Naur linuxcnc.orig/src/hal/components/retain_usr.c linuxcnc/src/hal/components/retain_usr.c
+--- linuxcnc.orig/src/hal/components/retain_usr.c	1970-01-01 01:00:00.000000000 +0100
++++ linuxcnc/src/hal/components/retain_usr.c	2020-01-17 10:02:27.683116000 +0100
+@@ -0,0 +1,418 @@
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdint.h>
++#include <signal.h>
++#include <unistd.h>
++#include <string.h>
++#include <sched.h>
++#include <time.h>
++#include <sys/eventfd.h>
++
++#include "rtapi.h"
++#include "hal.h"
++#include "../hal_priv.h"
++
++#include "retain.h"
++
++#define COMPNAME "retain_usr"
++
++#define SYNC_TIMEOUT_MS	1000LL
++#define POLL_PERIOD_MS	1000LL
++
++static int exit_event;
++
++static hal_u32_t *action_param;
++
++typedef struct {
++  hal_u32_t *update_count;
++} RETAIN_HAL_T;
++
++long long get_ms_ticks(void) {
++  struct timespec tp;
++  clock_gettime(CLOCK_MONOTONIC, &tp);
++  return (long long) tp.tv_sec * 1000LL + ((long long) tp.tv_nsec / 1000000LL);
++}
++
++static void sigtermHandler(int sig) {
++  uint64_t u = 1;
++  if (write(exit_event, &u, sizeof(uint64_t)) < 0) {
++    fprintf(stderr, COMPNAME ": ERROR: error writing exit event\n");
++  }
++}
++
++static void *get_shared_param_ptr(const char *name, hal_type_t type) {
++  hal_param_t *param;
++
++  // find parameter
++  param = halpr_find_param_by_name(name);
++  if (param == NULL) {
++    return NULL;
++  }
++
++  // check datatype
++  if (param->type != type) {
++    return NULL;
++  }
++
++  // check for RW
++  if (param->dir == HAL_RO) {
++    return NULL;
++  }
++
++  return (void*) SHMPTR(param->data_ptr);
++}
++
++static int sync_action(int action) {
++  long long timeout;
++
++  // set action flag
++  *action_param = action;
++
++  // wait for finished job, check timeout
++  timeout = get_ms_ticks() + SYNC_TIMEOUT_MS;
++  while (*action_param == action) {
++    // check for timeout
++    if (get_ms_ticks() > timeout) {
++      return -1;
++    }
++    sched_yield();
++  }
++
++  // return flag for changed data
++  return (*action_param == RETAIN_ACTION_STORE);
++}
++
++static int save_vars(const char *file_name) {
++  hal_data_t *hd = (hal_data_t *) hal_shmem_base;
++  int err = 1;
++  int ret;
++  char tmp_name[256];
++  FILE *f = NULL;
++  int next;
++  hal_sig_t *sig;
++
++  if (snprintf(tmp_name, sizeof(tmp_name), "%s.tmp", file_name) >= sizeof(tmp_name)) {
++    fprintf(stderr, COMPNAME ": ERROR: var file name too long!\n");
++    goto fail0;
++  }
++
++  if ((f = fopen(tmp_name, "w")) == NULL) {
++    fprintf(stderr, COMPNAME ": ERROR: unable to open temporary var file for writing!\n");
++    goto fail0;
++  }
++
++  rtapi_mutex_get(&(hd->mutex));
++  next = hd->sig_list_ptr;
++  while (next != 0) {
++    sig = SHMPTR(next);
++    next = sig->next_ptr;
++
++    // store retain signals only
++    if ((sig->flags & HAL_SIGFLAG_RETAIN) == 0) {
++      continue;
++    }
++
++    switch (sig->type) {
++      case HAL_BIT:
++        ret = fprintf(f, "%s %s\n", sig->name, sig->retain_val.bit ? "TRUE" : "FALSE");
++        break;
++      case HAL_U32:
++        ret = fprintf(f, "%s %u\n", sig->name, sig->retain_val.u32);
++        break;
++      case HAL_S32:
++        ret = fprintf(f, "%s %d\n", sig->name, sig->retain_val.s32);
++        break;
++      case HAL_FLOAT:
++        ret = fprintf(f, "%s %.6f\n", sig->name, sig->retain_val.flt);
++        break;
++      default:
++        break;
++    }
++
++    // handle error
++    if (ret < 0) {
++      rtapi_mutex_give(&(hd->mutex));
++      fprintf(stderr, COMPNAME ": ERROR: unable to write value to var file!\n");
++      goto fail1;
++    }
++  }
++  rtapi_mutex_give(&(hd->mutex));
++
++  if (fflush(f)) {
++    fprintf(stderr, COMPNAME ": ERROR: unable to flush var file!\n");
++    goto fail1;
++  }
++
++  if (fdatasync(fileno(f))) {
++    fprintf(stderr, COMPNAME ": ERROR: unable to sync var file!\n");
++    goto fail1;
++  }
++
++  if (fclose(f)) {
++    fprintf(stderr, COMPNAME ": ERROR: unable to close var file!\n");
++    goto fail1;
++  }
++  f = NULL;
++
++  if (rename(tmp_name, file_name) < 0) {
++    fprintf(stderr, COMPNAME ": ERROR: unable to rename var file!\n");
++    goto fail1;
++  }
++
++  err = 0;
++
++fail1:
++  if (f != NULL) {
++    fclose(f);
++  }
++fail0:
++  return err;
++}
++
++static int load_vars(const char *file_name) {
++  hal_data_t *hd = (hal_data_t *) hal_shmem_base;
++  int err = 1;
++  FILE *f;
++  char line[1024];
++  char *name, *value, *s;
++  hal_sig_t *sig;
++  void *data_addr;
++  double flt;
++  int32_t s32;
++  uint32_t u32;
++
++  if ((f = fopen(file_name, "r")) == NULL) {
++    fprintf(stderr, COMPNAME ": ERROR: unable to open var file for reading!\n");
++    goto fail0;
++  }
++
++  rtapi_mutex_get(&(hd->mutex));
++  while(fgets(line, sizeof(line), f)) {
++    // skip initial blanks
++    for (name = line; *name && strchr("\t ", *name); name++);
++
++    // skip comment lines
++    if (*name == '#') {
++      continue;
++    }
++
++    // search separator
++    value = strchr(name, ' ');
++    if (value == NULL) {
++      continue;
++    }
++    *(value++) = 0;
++
++    // skip empty names
++    if (*name == 0) {
++      continue;
++    }
++
++    // terminate value
++    for (s = value; *s && !strchr("\t \r\n", *s); s++);
++    *s = 0;
++
++    // skip empty values
++    if (*value == 0) {
++      continue;
++    }
++
++    // find signal
++    sig = halpr_find_sig_by_name(name);
++    if (sig == NULL) {
++      continue;
++    }
++
++    // skip signals with writers
++    if (sig->writers > 0) {
++      fprintf(stderr, COMPNAME ": ERROR: unable to restore signal %s (has writers)\n", sig->name);
++      continue;
++    }
++
++    // set retain signals only
++    if ((sig->flags & HAL_SIGFLAG_RETAIN) == 0) {
++      continue;
++    }
++
++    // set value
++    data_addr = SHMPTR(sig->data_ptr);
++    switch (sig->type) {
++      case HAL_BIT:
++        if ((strcmp("1", value) == 0) || (strcasecmp("TRUE", value) == 0)) {
++          *((hal_bit_t *) data_addr) = 1;
++        } else if ((strcmp("0", value) == 0) || (strcasecmp("FALSE", value)) == 0) {
++          *((hal_bit_t *) data_addr) = 0;
++        } else {
++          fprintf(stderr, COMPNAME ": ERROR: unable to restore signal %s (invalid bit value '%s')\n", sig->name, value);
++        }
++        break;
++      case HAL_U32:
++        u32 = strtoul(value, &s, 0);
++        if (*s == 0) {
++          *((hal_u32_t *) data_addr) = u32;
++        } else {
++          fprintf(stderr, COMPNAME ": ERROR: unable to restore signal %s (invalid u32 value '%s')\n", sig->name, value);
++        }
++        break;
++      case HAL_S32:
++        s32 = strtol(value, &s, 0);
++        if (*s == 0) {
++          *((hal_s32_t *) data_addr) = s32;
++        } else {
++          fprintf(stderr, COMPNAME ": ERROR: unable to restore signal %s (invalid s32 value '%s')\n", sig->name, value);
++        }
++        break;
++      case HAL_FLOAT:
++        flt = strtod(value, &s);
++        if (*s == 0) {
++          *((hal_float_t *) data_addr) = flt;
++        } else {
++          fprintf(stderr, COMPNAME ": ERROR: unable to restore signal %s (invalid float value '%s')\n", sig->name, value);
++        }
++        break;
++      default:
++        break;
++    }
++  }
++  rtapi_mutex_give(&(hd->mutex));
++
++  err = 0;
++
++  fclose(f);
++fail0:
++  return err;
++}
++
++int main(int argc, char **argv) {
++  int err = 1;
++  int comp_id;
++  RETAIN_HAL_T *hal;
++  uint64_t u;
++  char *varfile;
++  long poll_period;
++  fd_set rfds;
++  struct timeval tv;
++  int do_create, changed, do_exit;
++
++  // get config file name
++  if (argc < 2) {
++    fprintf(stderr, COMPNAME ": ERROR: usage: " COMPNAME " <varfile> [poll time]\n");
++    goto fail0;
++  }
++  varfile = argv[1];
++
++  // get poll time
++  poll_period = 0;
++  if (argc >= 3) {
++    poll_period = atol(argv[2]);
++  }
++  if (poll_period == 0) {
++    poll_period = POLL_PERIOD_MS;
++  }
++
++  // init hal
++  comp_id = hal_init(COMPNAME);
++  if (comp_id < 0) {
++    fprintf(stderr, COMPNAME ": ERROR: hal init failed!\n");
++    goto fail0;
++  }
++
++  // allocate hal memory
++  hal = hal_malloc(sizeof(RETAIN_HAL_T));
++  if (hal == NULL) {
++    fprintf(stderr, COMPNAME ": ERROR: unable to allocate HAL shared memory\n");
++    goto fail1;
++  }
++
++  // register pins
++  if (hal_pin_u32_new("retain-usr.update-count", HAL_OUT, &(hal->update_count), comp_id) != 0) {
++    fprintf(stderr, COMPNAME ": ERROR: unable to register pin retain-usr.update-count\n");
++    goto fail1;
++  }
++  *(hal->update_count) = 0;
++
++  // get shared pins
++  action_param = (hal_u32_t *) get_shared_param_ptr(RETAIN_ACTION_PARAM, HAL_U32);
++  if (action_param == NULL) {
++    fprintf(stderr, COMPNAME ": ERROR: unable to find shared parameter " RETAIN_ACTION_PARAM ". Retain RT comp loaded?\n");
++    goto fail1;
++  }
++
++  // create exit event
++  exit_event = eventfd(0, 0);
++  if (exit_event < 0) {
++    fprintf(stderr, COMPNAME ": ERROR: unable to create exit event\n");
++    goto fail1;
++  }
++
++  // install signal handler
++  struct sigaction act;
++  memset(&act, 0, sizeof(act));
++  act.sa_handler = &sigtermHandler;
++  if (sigaction(SIGTERM, &act, NULL) < 0)
++  {
++    fprintf(stderr, COMPNAME ": ERROR: Unable to register SIGTERM handler.");
++    goto fail2;
++  }
++
++  // restore values, if var file is present
++  do_create = 1;
++  if (access(varfile, F_OK) == 0) {
++    if (load_vars(varfile)) {
++      goto fail2;
++    }
++    do_create = 0;
++  }
++
++  // everything is fine
++  hal_ready(comp_id);
++
++  // do first sync (will also wait for starting RT task)
++  if (sync_action(RETAIN_ACTION_READ) < 0) {
++    fprintf(stderr, COMPNAME ": ERROR: Timeout while waiting for sync_read.");
++    goto fail2;
++  }
++
++  FD_ZERO(&rfds);
++  FD_SET(exit_event, &rfds);
++  do_exit = 0;
++  while (1) {
++    // check for changes
++    changed = sync_action(RETAIN_ACTION_READ);
++    if (changed >= 0) {
++      if (do_create || changed) {
++        save_vars(varfile);
++        (*(hal->update_count))++;
++      }
++      do_create = 0;
++    }
++
++    // check for exit flag
++    if (do_exit) {
++      err = 0;
++      break;
++    }
++
++    // wait poll time
++    tv.tv_sec = poll_period / 1000LL;
++    tv.tv_usec = (poll_period % 1000LL) * 1000LL;
++    if (select(1, &rfds, NULL, NULL, &tv) < 0) {
++      goto fail2;
++    }
++
++    // check for SIGTERM
++    // set only a flag to do a final sync
++    if (FD_ISSET(exit_event, &rfds)) {
++      read(exit_event, &u, sizeof(uint64_t));
++      do_exit = 1;
++    }
++  }
++
++fail2:
++  close(exit_event);
++fail1:
++  hal_exit(comp_id);
++fail0:
++  return err;
++}
++
+diff -Naur linuxcnc.orig/src/hal/components/Submakefile linuxcnc/src/hal/components/Submakefile
+--- linuxcnc.orig/src/hal/components/Submakefile	2020-01-02 20:02:01.000000000 +0100
++++ linuxcnc/src/hal/components/Submakefile	2020-01-17 10:02:27.683116000 +0100
+@@ -70,6 +70,14 @@
+ 	$(Q)$(CC) $(LDFLAGS) -o $@ $^
+ TARGETS += ../bin/halsampler
+ 
++RETAINUSRSRC = hal/components/retain_usr.c
++USERSRCS += $(RETAINUSRSRC)
++
++../bin/retain_usr: $(call TOOBJS, $(RETAINUSRSRC)) ../lib/liblinuxcnchal.so.0
++	$(ECHO) Linking $(notdir $@)
++	$(Q)$(CC) $(LDFLAGS) -o $@ $^ -lrt
++TARGETS += ../bin/retain_usr
++
+ hal/components/conv_float_s32.comp: hal/components/conv.comp.in hal/components/mkconv.sh hal/components/Submakefile
+ 	$(ECHO) converting conv for $(notdir $@)
+ 	$(Q)sh hal/components/mkconv.sh float s32 "" -2147483647-1 2147483647 < $< > $@
+diff -Naur linuxcnc.orig/src/hal/hal_lib.c linuxcnc/src/hal/hal_lib.c
+--- linuxcnc.orig/src/hal/hal_lib.c	2020-01-02 20:02:01.000000000 +0100
++++ linuxcnc/src/hal/hal_lib.c	2020-01-17 10:02:27.683116000 +0100
+@@ -915,15 +915,19 @@
+     switch (type) {
+     case HAL_BIT:
+ 	*((hal_bit_t *) data_addr) = 0;
++	new->retain_val.bit = 0;
+ 	break;
+     case HAL_S32:
+ 	*((hal_s32_t *) data_addr) = 0;
++	new->retain_val.s32 = 0;
+         break;
+     case HAL_U32:
+ 	*((hal_u32_t *) data_addr) = 0;
++	new->retain_val.u32 = 0;
+         break;
+     case HAL_FLOAT:
+ 	*((hal_float_t *) data_addr) = 0.0;
++	new->retain_val.flt = 0.0;
+ 	break;
+     default:
+ 	break;
+@@ -1087,6 +1091,14 @@
+ 	    "HAL: ERROR: signal '%s' already has output or I/O pin(s)\n", sig_name);
+ 	return -EINVAL;
+     }
++    /* linking output pin to retain sig? */
++    if ((pin->dir == HAL_OUT) && (sig->flags & HAL_SIGFLAG_RETAIN)) {
++	/* yes, can't do that */
++	rtapi_mutex_give(&(hal_data->mutex));
++	rtapi_print_msg(RTAPI_MSG_ERR,
++	    "HAL: ERROR: retain signal '%s' can not have output pin(s)\n", sig_name);
++	return -EINVAL;
++    }
+     /* linking bidir pin to sig that already has output pin? */
+     if ((pin->dir == HAL_IO) && (sig->writers > 0)) {
+ 	/* yes, can't do that */
+diff -Naur linuxcnc.orig/src/hal/hal_priv.h linuxcnc/src/hal/hal_priv.h
+--- linuxcnc.orig/src/hal/hal_priv.h	2020-01-17 10:02:27.163110550 +0100
++++ linuxcnc/src/hal/hal_priv.h	2020-01-17 10:02:27.683116000 +0100
+@@ -227,6 +227,22 @@
+     char name[HAL_NAME_LEN + 1];	/* pin name */
+ } hal_pin_t;
+ 
++/** HAL signal flags.
++    Addditional flags for signals (i.e. retain)
++    Values are used as bitmask and can be or'ed
++*/
++
++typedef enum {
++    HAL_SIGFLAG_RETAIN = 1
++} hal_sig_flags_t;
++
++typedef union {
++  hal_bit_t bit;
++  hal_u32_t u32;
++  hal_s32_t s32;
++  hal_float_t flt;
++} hal_sig_val_t;
++
+ /** HAL 'signal' data structure.
+     This structure contains information about a 'signal' object.
+ */
+@@ -237,6 +253,8 @@
+     int readers;		/* number of input pins linked */
+     int writers;		/* number of output pins linked */
+     int bidirs;			/* number of I/O pins linked */
++    int flags;			/* flag (e.g. HAL_FLAG_RETAIN) */
++    hal_sig_val_t retain_val;	/* value for retain change tracking */
+     char name[HAL_NAME_LEN + 1];	/* signal name */
+ } hal_sig_t;
+ 
+diff -Naur linuxcnc.orig/src/hal/utils/halcmd.c linuxcnc/src/hal/utils/halcmd.c
+--- linuxcnc.orig/src/hal/utils/halcmd.c	2020-01-02 20:02:01.000000000 +0100
++++ linuxcnc/src/hal/utils/halcmd.c	2020-01-17 10:02:27.683116000 +0100
+@@ -153,6 +153,7 @@
+     {"lock",    FUNCT(do_lock_cmd),    A_ONE | A_OPTIONAL },
+     {"net",     FUNCT(do_net_cmd),     A_ONE | A_PLUS | A_REMOVE_ARROWS },
+     {"newsig",  FUNCT(do_newsig_cmd),  A_TWO },
++    {"retain",  FUNCT(do_retain_cmd),  A_ONE },
+     {"save",    FUNCT(do_save_cmd),    A_TWO | A_OPTIONAL | A_TILDE },
+     {"setexact_for_test_suite_only", FUNCT(do_setexact_cmd), A_ZERO },
+     {"setp",    FUNCT(do_setp_cmd),    A_TWO },
+@@ -169,6 +170,7 @@
+     {"unloadrt", FUNCT(do_unloadrt_cmd), A_ONE },
+     {"unloadusr", FUNCT(do_unloadusr_cmd), A_ONE },
+     {"unlock",  FUNCT(do_unlock_cmd),  A_ONE | A_OPTIONAL },
++    {"unretain", FUNCT(do_unretain_cmd), A_ONE },
+     {"waitusr", FUNCT(do_waitusr_cmd), A_ONE },
+ };
+ int halcmd_ncommands = (sizeof(halcmd_commands) / sizeof(halcmd_commands[0]));
+diff -Naur linuxcnc.orig/src/hal/utils/halcmd_commands.c linuxcnc/src/hal/utils/halcmd_commands.c
+--- linuxcnc.orig/src/hal/utils/halcmd_commands.c	2020-01-02 20:02:01.000000000 +0100
++++ linuxcnc/src/hal/utils/halcmd_commands.c	2020-01-17 10:02:27.683116000 +0100
+@@ -69,7 +69,7 @@
+ static void print_thread_info(char **patterns);
+ static void print_comp_names(char **patterns);
+ static void print_pin_names(char **patterns);
+-static void print_sig_names(char **patterns);
++static void print_sig_names(char **patterns, int flags);
+ static void print_param_names(char **patterns);
+ static void print_funct_names(char **patterns);
+ static void print_thread_names(char **patterns);
+@@ -375,13 +375,14 @@
+ }
+ 
+ static int preflight_net_cmd(char *signal, hal_sig_t *sig, char *pins[]) {
+-    int i, type=-1, writers=0, bidirs=0, pincnt=0;
++    int i, type=-1, writers=0, bidirs=0, pincnt=0, retain=0;
+     char *writer_name=0, *bidir_name=0;
+     /* if signal already exists, use its info */
+     if (sig) {
+ 	type = sig->type;
+ 	writers = sig->writers;
+ 	bidirs = sig->bidirs;
++	retain = sig->flags & HAL_SIGFLAG_RETAIN;
+     }
+ 
+     if(writers || bidirs) 
+@@ -437,6 +438,12 @@
+                         bidir_name ? bidir_name : writer_name);
+                 return -EINVAL;
+             }
++            if(retain) {
++                halcmd_error(
++                    "Retain signal '%s' can not add %s pin '%s'\n",
++                        signal, pin_data_dir(pin->dir), pin->name);
++                return -EINVAL;
++            }
+             writer_name = pin->name;
+             writers++;
+         }
+@@ -1012,9 +1019,9 @@
+     } else if (strcmp(type, "pin") == 0) {
+ 	print_pin_names(patterns);
+     } else if (strcmp(type, "sig") == 0) {
+-	print_sig_names(patterns);
++	print_sig_names(patterns, 0);
+     } else if (strcmp(type, "signal") == 0) {
+-	print_sig_names(patterns);
++	print_sig_names(patterns, 0);
+     } else if (strcmp(type, "param") == 0) {
+ 	print_param_names(patterns);
+     } else if (strcmp(type, "parameter") == 0) {
+@@ -1025,6 +1032,8 @@
+ 	print_funct_names(patterns);
+     } else if (strcmp(type, "thread") == 0) {
+ 	print_thread_names(patterns);
++    } else if (strcmp(type, "retain") == 0) {
++	print_sig_names(patterns, HAL_SIGFLAG_RETAIN);
+     } else {
+ 	halcmd_error("Unknown 'list' type '%s'\n", type);
+ 	return -1;
+@@ -1977,7 +1986,7 @@
+     halcmd_output("\n");
+ }
+ 
+-static void print_sig_names(char **patterns)
++static void print_sig_names(char **patterns, int flags)
+ {
+     int next;
+     hal_sig_t *sig;
+@@ -1986,7 +1995,7 @@
+     next = hal_data->sig_list_ptr;
+     while (next != 0) {
+ 	sig = SHMPTR(next);
+-	if ( match(patterns, sig->name) ) {
++	if ( match(patterns, sig->name) && (sig->flags & flags) == flags ) {
+ 	    halcmd_output("%s ", sig->name);
+ 	}
+ 	next = sig->next_ptr;
+@@ -2682,6 +2691,52 @@
+     return retval;
+ }
+ 
++int do_retain_cmd(char *name)
++{
++    hal_sig_t *sig;
++    rtapi_print_msg(RTAPI_MSG_DBG, "setting retain flag of signal '%s'\n", name);
++    /* get mutex before accessing shared data */
++    rtapi_mutex_get(&(hal_data->mutex));
++    /* search signal list for name */
++    sig = halpr_find_sig_by_name(name);
++    if (sig == 0) {
++	rtapi_mutex_give(&(hal_data->mutex));
++	halcmd_error("Signal '%s' not found\n", name);
++	return -EINVAL;
++    }
++    /* found it - does it have a writer? */
++    if (sig->writers > 0) {
++	rtapi_mutex_give(&(hal_data->mutex));
++	halcmd_error("Signal '%s' already has writer\n", name);
++	return -EINVAL;
++    }
++    /* set retain flag */
++    sig->flags |= HAL_SIGFLAG_RETAIN;
++    halcmd_info("Signal '%s' retain flag set\n", name);
++    rtapi_mutex_give(&(hal_data->mutex));
++    return 0;
++}
++
++int do_unretain_cmd(char *name)
++{
++    hal_sig_t *sig;
++    rtapi_print_msg(RTAPI_MSG_DBG, "resetting retain flag of signal '%s'\n", name);
++    /* get mutex before accessing shared data */
++    rtapi_mutex_get(&(hal_data->mutex));
++    /* search signal list for name */
++    sig = halpr_find_sig_by_name(name);
++    if (sig == 0) {
++	rtapi_mutex_give(&(hal_data->mutex));
++	halcmd_error("Signal '%s' not found\n", name);
++	return -EINVAL;
++    }
++    /* reset retain flag */
++    sig->flags &= ~HAL_SIGFLAG_RETAIN;
++    halcmd_info("Signal '%s' retain flag reset\n", name);
++    rtapi_mutex_give(&(hal_data->mutex));
++    return 0;
++}
++
+ int do_help_cmd(char *command)
+ {
+     if (!command) {
+diff -Naur linuxcnc.orig/src/hal/utils/halcmd_commands.h linuxcnc/src/hal/utils/halcmd_commands.h
+--- linuxcnc.orig/src/hal/utils/halcmd_commands.h	2020-01-02 20:02:01.000000000 +0100
++++ linuxcnc/src/hal/utils/halcmd_commands.h	2020-01-17 10:02:27.683116000 +0100
+@@ -81,6 +81,8 @@
+ extern int do_waitusr_cmd(char *comp_name);
+ extern int do_save_cmd(char *type, char *filename);
+ extern int do_setexact_cmd(void);
++extern int do_retain_cmd(char *name);
++extern int do_unretain_cmd(char *name);
+ 
+ pid_t hal_systemv_nowait(char *const argv[]);
+ int hal_systemv(char *const argv[]);
+diff -Naur linuxcnc.orig/src/Makefile linuxcnc/src/Makefile
+--- linuxcnc.orig/src/Makefile	2020-01-02 20:02:01.000000000 +0100
++++ linuxcnc/src/Makefile	2020-01-17 10:02:27.683116000 +0100
+@@ -796,6 +796,8 @@
+ streamer-objs := hal/components/streamer.o $(MATHSTUB)
+ obj-$(CONFIG_SAMPLER) += sampler.o
+ sampler-objs := hal/components/sampler.o $(MATHSTUB)
++obj-$(CONFIG_RETAIN) += retain.o
++retain-objs := hal/components/retain.o $(MATHSTUB)
+ 
+ # Subdirectory: hal/drivers
+ obj-$(CONFIG_HAL_PARPORT) += hal_parport.o
+@@ -1063,6 +1065,7 @@
+ ../rtlib/hal_ppmc$(MODULE_EXT): $(addprefix objects/rt,$(hal_ppmc-objs))
+ ../rtlib/hm2_eth$(MODULE_EXT): $(addprefix objects/rt,$(hm2_eth-objs))
+ ../rtlib/hm2_spi$(MODULE_EXT): $(addprefix objects/rt,$(hm2_spi-objs))
++../rtlib/retain$(MODULE_EXT): $(addprefix objects/rt,$(retain-objs))
+ 
+ ifeq ($(TRIVIAL_BUILD),no)
+ READ_RTDEPS = $(wildcard $(RTDEPS))
+diff -Naur linuxcnc.orig/src/Makefile.inc.in linuxcnc/src/Makefile.inc.in
+--- linuxcnc.orig/src/Makefile.inc.in	2020-01-02 20:02:01.000000000 +0100
++++ linuxcnc/src/Makefile.inc.in	2020-01-17 10:02:27.683116000 +0100
+@@ -205,6 +205,7 @@
+ CONFIG_MODMATH=m
+ CONFIG_STREAMER=m
+ CONFIG_SAMPLER=m
++CONFIG_RETAIN=m
+ 
+ # HAL drivers
+ CONFIG_UPARPORT=m

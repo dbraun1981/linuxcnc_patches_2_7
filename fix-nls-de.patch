@@ -1,0 +1,14 @@
+diff -Naur linuxcnc.orig/src/po/de.po linuxcnc/src/po/de.po
+--- linuxcnc.orig/src/po/de.po	2020-01-17 10:02:21.067046513 +0100
++++ linuxcnc/src/po/de.po	2020-01-17 10:02:23.575072890 +0100
+@@ -5723,6 +5723,10 @@
+ msgid "%"
+ msgstr "%"
+ 
++#: share/axis/tcl/axis.tcl:1727
++msgid "Rapid Override:"
++msgstr "Eilgang Übersteuerung:"
++
+ #: share/axis/tcl/axis.tcl:1711
+ #, fuzzy
+ msgid ""

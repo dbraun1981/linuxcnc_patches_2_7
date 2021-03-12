@@ -1,0 +1,12 @@
+diff -Naur linuxcnc.orig/src/hal/hal_priv.h linuxcnc/src/hal/hal_priv.h
+--- linuxcnc.orig/src/hal/hal_priv.h	2020-01-02 20:02:01.000000000 +0100
++++ linuxcnc/src/hal/hal_priv.h	2020-01-17 10:02:27.163110550 +0100
+@@ -329,7 +329,7 @@
+ 
+ #define HAL_KEY   0x48414C32	/* key used to open HAL shared memory */
+ #define HAL_VER   0x0000000D	/* version code */
+-#define HAL_SIZE  (75*4096)
++#define HAL_SIZE  (128*4096)
+ #define HAL_PSEUDO_COMP_PREFIX "__" /* prefix to identify a pseudo component */
+ 
+ /* These pointers are set by hal_init() to point to the shmem block

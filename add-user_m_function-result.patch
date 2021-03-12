@@ -1,0 +1,196 @@
+diff -Naur linuxcnc.orig/src/emc/nml_intf/canon.hh linuxcnc/src/emc/nml_intf/canon.hh
+--- linuxcnc.orig/src/emc/nml_intf/canon.hh	2020-01-02 20:02:01.000000000 +0100
++++ linuxcnc/src/emc/nml_intf/canon.hh	2020-01-17 10:02:20.035035646 +0100
+@@ -862,6 +862,9 @@
+ extern double GET_EXTERNAL_ANALOG_INPUT(int index, double def);
+ /* returns current value of the analog input selected by index.*/
+ 
++extern double GET_USER_DEFINED_RESULT();
++/* returns result of user defined function */
++
+ // Returns the mask of axes present in the system
+ extern int GET_EXTERNAL_AXIS_MASK();
+ 
+diff -Naur linuxcnc.orig/src/emc/nml_intf/emc_nml.hh linuxcnc/src/emc/nml_intf/emc_nml.hh
+--- linuxcnc.orig/src/emc/nml_intf/emc_nml.hh	2020-01-02 20:02:01.000000000 +0100
++++ linuxcnc/src/emc/nml_intf/emc_nml.hh	2020-01-17 10:02:20.035035646 +0100
+@@ -1434,6 +1434,7 @@
+     int task_paused;		// non-zero means task is paused
+     double delayLeft;           // delay time left of G4, M66..
+     int queuedMDIcommands;      // current length of MDI input queue
++    double user_defined_result; // result of user defined function
+ };
+ 
+ // declarations for EMC_TOOL classes
+diff -Naur linuxcnc.orig/src/emc/rs274ngc/gcodemodule.cc linuxcnc/src/emc/rs274ngc/gcodemodule.cc
+--- linuxcnc.orig/src/emc/rs274ngc/gcodemodule.cc	2020-01-02 20:02:01.000000000 +0100
++++ linuxcnc/src/emc/rs274ngc/gcodemodule.cc	2020-01-17 10:02:20.039035687 +0100
+@@ -673,6 +673,7 @@
+ }
+ 
+ USER_DEFINED_FUNCTION_TYPE USER_DEFINED_FUNCTION[USER_DEFINED_FUNCTION_NUM];
++double GET_USER_DEFINED_RESULT() { return 0.0; }
+ 
+ CANON_MOTION_MODE motion_mode;
+ void SET_MOTION_CONTROL_MODE(CANON_MOTION_MODE mode, double tolerance) { motion_mode = mode; }
+diff -Naur linuxcnc.orig/src/emc/rs274ngc/interp_convert.cc linuxcnc/src/emc/rs274ngc/interp_convert.cc
+--- linuxcnc.orig/src/emc/rs274ngc/interp_convert.cc	2020-01-02 20:02:01.000000000 +0100
++++ linuxcnc/src/emc/rs274ngc/interp_convert.cc	2020-01-17 10:02:20.039035687 +0100
+@@ -3250,6 +3250,7 @@
+       CHKS(1, NCE_UNKNOWN_M_CODE_USED,index);
+     }
+     enqueue_M_USER_COMMAND(index,block->p_number,block->q_number);
++    settings->user_defined_flag = true; 
+   }
+   return INTERP_OK;
+ }
+diff -Naur linuxcnc.orig/src/emc/rs274ngc/interp_execute.cc linuxcnc/src/emc/rs274ngc/interp_execute.cc
+--- linuxcnc.orig/src/emc/rs274ngc/interp_execute.cc	2020-01-02 20:02:01.000000000 +0100
++++ linuxcnc/src/emc/rs274ngc/interp_execute.cc	2020-01-17 10:02:20.039035687 +0100
+@@ -302,6 +302,9 @@
+   if (settings->toolchange_flag)
+       return (INTERP_EXECUTE_FINISH);
+ 
++  if (settings->user_defined_flag)
++      return (INTERP_EXECUTE_FINISH);
++
+   return INTERP_OK;
+ }
+ 
+diff -Naur linuxcnc.orig/src/emc/rs274ngc/interp_internal.hh linuxcnc/src/emc/rs274ngc/interp_internal.hh
+--- linuxcnc.orig/src/emc/rs274ngc/interp_internal.hh	2020-01-02 20:02:01.000000000 +0100
++++ linuxcnc/src/emc/rs274ngc/interp_internal.hh	2020-01-17 10:02:20.039035687 +0100
+@@ -710,6 +710,7 @@
+   bool probe_flag;            // flag indicating probing done
+   bool input_flag;            // flag indicating waiting for input done
+   bool toolchange_flag;       // flag indicating we just had a tool change
++  bool user_defined_flag;     // flag indicating we just had called a user defined function
+   int input_index;		// channel queried
+   bool input_digital;		// input queried was digital (false=analog)
+   bool cutter_comp_firstmove; // this is the first comp move
+diff -Naur linuxcnc.orig/src/emc/rs274ngc/rs274ngc_pre.cc linuxcnc/src/emc/rs274ngc/rs274ngc_pre.cc
+--- linuxcnc.orig/src/emc/rs274ngc/rs274ngc_pre.cc	2020-01-02 20:02:01.000000000 +0100
++++ linuxcnc/src/emc/rs274ngc/rs274ngc_pre.cc	2020-01-17 10:02:20.039035687 +0100
+@@ -1116,6 +1116,7 @@
+ //_setup.plane set in Interp::synch
+   _setup.probe_flag = false;
+   _setup.toolchange_flag = false;
++  _setup.user_defined_flag = false;
+   _setup.input_flag = false;
+   _setup.input_index = -1;
+   _setup.input_digital = false;
+@@ -1398,6 +1399,13 @@
+ 	}
+ 	settings->input_flag = false;
+     }
++
++    if (settings->user_defined_flag) {
++	CHKS((GET_EXTERNAL_QUEUE_EMPTY() == 0),
++	     _("Queue is not empty after user defined function"));
++	settings->parameters[5399] = GET_USER_DEFINED_RESULT();
++	settings->user_defined_flag = false;
++    }
+     return INTERP_OK;
+ }
+ 
+@@ -1473,6 +1481,12 @@
+     }
+     _setup.input_flag = false;
+   }
++  if (_setup.user_defined_flag) {
++    CHKS((GET_EXTERNAL_QUEUE_EMPTY() == 0),
++         _("Queue is not empty after user defined function"));
++    _setup.parameters[5399] = GET_USER_DEFINED_RESULT();
++    _setup.user_defined_flag = false;
++  }
+ #endif
+ 
+   // Support for restartable Python handlers during Auto mode
+@@ -2439,6 +2453,7 @@
+     _setup.toolchange_flag = false;
+     _setup.probe_flag = false;
+     _setup.input_flag = false;
++    _setup.user_defined_flag = false;
+ 
+     if (_setup.on_abort_command == NULL) {
+ 	return -1;
+diff -Naur linuxcnc.orig/src/emc/sai/saicanon.cc linuxcnc/src/emc/sai/saicanon.cc
+--- linuxcnc.orig/src/emc/sai/saicanon.cc	2020-01-02 20:02:01.000000000 +0100
++++ linuxcnc/src/emc/sai/saicanon.cc	2020-01-17 10:02:20.039035687 +0100
+@@ -1049,6 +1049,11 @@
+   return 0;
+ }
+ 
++double GET_USER_DEFINED_RESULT()
++{
++  return 0.0;
++}
++
+ void SET_MOTION_OUTPUT_BIT(int index)
+ {
+     PRINT1("SET_MOTION_OUTPUT_BIT(%d)\n", index);
+diff -Naur linuxcnc.orig/src/emc/task/emccanon.cc linuxcnc/src/emc/task/emccanon.cc
+--- linuxcnc.orig/src/emc/task/emccanon.cc	2020-01-02 20:02:01.000000000 +0100
++++ linuxcnc/src/emc/task/emccanon.cc	2020-01-17 10:02:20.039035687 +0100
+@@ -3102,6 +3102,11 @@
+     return 0;
+ }
+ 
++double GET_USER_DEFINED_RESULT()
++{
++  return emcStatus->task.user_defined_result;
++}
++
+ /*! \function SET_MOTION_OUTPUT_BIT
+ 
+   sets a DIO pin
+diff -Naur linuxcnc.orig/src/emc/task/emctaskmain.cc linuxcnc/src/emc/task/emctaskmain.cc
+--- linuxcnc.orig/src/emc/task/emctaskmain.cc	2020-01-02 20:02:01.000000000 +0100
++++ linuxcnc/src/emc/task/emctaskmain.cc	2020-01-17 10:02:20.039035687 +0100
+@@ -324,6 +324,7 @@
+ 	}
+     }
+ 
++    emcStatus->task.user_defined_result = 0.0;
+     emcSystemCmdPid = fork();
+ 
+     if (-1 == emcSystemCmdPid) {
+@@ -2493,6 +2494,10 @@
+     int retval = 0;
+     int status;			// status of child from EMC_SYSTEM_CMD
+     pid_t pid;			// pid returned from waitpid()
++    double end;
++
++#define TERM_RETRY_TIME 5.0
++#define TERM_RETRY_INTERVAL 0.02
+ 
+     // first check for an abandoned system command and abort it
+     if (emcSystemCmdPid != 0 &&
+@@ -2503,6 +2508,16 @@
+ 		      emcSystemCmdPid);
+ 	}
+ 	kill(emcSystemCmdPid, SIGINT);
++	end = TERM_RETRY_TIME;
++	while (waitpid(emcSystemCmdPid, &status, WNOHANG) == 0) {
++	    esleep(TERM_RETRY_INTERVAL);
++	    end -= TERM_RETRY_INTERVAL;
++	    if (end <= 0.0) {
++		kill(emcSystemCmdPid, SIGKILL);
++		waitpid(emcSystemCmdPid, &status, 0);
++		break;
++	    }
++	}
+ 	emcSystemCmdPid = 0;
+     }
+ 
+@@ -2768,8 +2783,9 @@
+ 	}
+ 	// else child has finished
+ 	if (WIFEXITED(status)) {
+-	    if (0 == WEXITSTATUS(status)) {
++	    if (0 == WEXITSTATUS(status) || (WEXITSTATUS(status) >= 32 && WEXITSTATUS(status) < 64)) {
+ 		// child exited normally
++		emcStatus->task.user_defined_result = (double)WEXITSTATUS(status);
+ 		emcSystemCmdPid = 0;
+ 		emcStatus->task.execState = EMC_TASK_EXEC_DONE;
+ 		emcTaskEager = 1;

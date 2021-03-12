@@ -1,0 +1,14 @@
+diff -Naur linuxcnc.orig/debian/configure linuxcnc/debian/configure
+--- linuxcnc.orig/debian/configure	2020-01-02 20:02:01.000000000 +0100
++++ linuxcnc/debian/configure	2020-01-17 10:02:29.707137199 +0100
+@@ -134,8 +134,8 @@
+         PYTHON_IMAGING_TK="python${PYTHON_VERSION}-pil.imagetk"
+         YAPPS_RUNTIME="python-yapps"
+ 	;;
+-Debian-9.*|Ubuntu-18.*|LinuxMint-19.*)
+-	EXTRA_BUILD=dvipng,texlive-extra-utils,texlive-latex-recommended,texlive-fonts-recommended,ghostscript,imagemagick,texlive-lang-polish,texlive-font-utils,kmod,dh-python,asciidoc-dblatex
++Debian-9.*|Ubuntu-18.*|LinuxMint-19.*|Raspbian-9.*)
++	EXTRA_BUILD=dvipng,texlive-extra-utils,texlive-latex-recommended,texlive-fonts-recommended,ghostscript,imagemagick,texlive-lang-polish,texlive-font-utils,kmod,dh-python,asciidoc-dblatex,bwidget,libtk-img,tclx
+ 	TCLTK_VERSION=8.6
+         PYTHON_PACKAGING=dh_python2
+         PYTHON_GST=python-gst-1.0,gstreamer1.0-plugins-base

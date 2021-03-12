@@ -1,0 +1,120 @@
+diff -Naur linuxcnc.orig/src/emc/ini/iniaxis.cc linuxcnc/src/emc/ini/iniaxis.cc
+--- linuxcnc.orig/src/emc/ini/iniaxis.cc	2020-01-02 20:02:01.000000000 +0100
++++ linuxcnc/src/emc/ini/iniaxis.cc	2020-01-17 10:02:25.647094649 +0100
+@@ -95,6 +95,7 @@
+     bool use_index;
+     bool ignore_limits;
+     bool is_shared;
++    bool is_absolute;
+     int sequence;
+     int volatile_home;
+     int locking_indexer;
+@@ -208,6 +209,8 @@
+         axisIniFile->Find(&home_final_vel, "HOME_FINAL_VEL", axisString);
+         is_shared = false;	        // default
+         axisIniFile->Find(&is_shared, "HOME_IS_SHARED", axisString);
++        is_absolute = false;	        // default
++        axisIniFile->Find(&is_absolute, "HOME_IS_ABSOLUTE", axisString);
+         use_index = false;	        // default
+         axisIniFile->Find(&use_index, "HOME_USE_INDEX", axisString);
+         ignore_limits = false;	        // default
+@@ -222,7 +225,8 @@
+         // issue NML message to set all params
+         if (0 != emcAxisSetHomingParams(axis, home, offset, home_final_vel, search_vel,
+                                         latch_vel, (int)use_index, (int)ignore_limits,
+-                                        (int)is_shared, sequence, volatile_home, locking_indexer)) {
++                                        (int)is_shared, (int)is_absolute, sequence,
++                                        volatile_home, locking_indexer)) {
+             if (emc_debug & EMC_DEBUG_CONFIG) {
+                 rcs_print_error("bad return from emcAxisSetHomingParams\n");
+             }
+diff -Naur linuxcnc.orig/src/emc/motion/homing.c linuxcnc/src/emc/motion/homing.c
+--- linuxcnc.orig/src/emc/motion/homing.c	2020-01-02 20:02:01.000000000 +0100
++++ linuxcnc/src/emc/motion/homing.c	2020-01-17 10:02:25.647094649 +0100
+@@ -256,7 +256,17 @@
+ 		/* reset delay counter */
+ 		joint->home_pause_timer = 0;
+ 		/* figure out exactly what homing sequence is needed */
+-		if (joint->home_flags & HOME_UNLOCK_FIRST) {
++		if (joint->home_flags & HOME_IS_ABSOLUTE) {
++		  offset = joint->home_offset - joint->motor_offset;
++		  /* this moves the internal position but does not affect the
++		     motor position */
++		  joint->pos_cmd += offset;
++		  joint->pos_fb += offset;
++		  joint->free_pos_cmd += offset;
++		  joint->motor_offset = joint->home_offset;
++		  joint->home_state = (joint->home_final_vel == 0.0) ? HOME_LOCK : HOME_FINAL_MOVE_START;
++		  immediate_state = 1;
++		} else if (joint->home_flags & HOME_UNLOCK_FIRST) {
+ 		    joint->home_state = HOME_UNLOCK;
+ 		} else {
+ 		    joint->home_state = HOME_UNLOCK_WAIT;
+diff -Naur linuxcnc.orig/src/emc/motion/motion.h linuxcnc/src/emc/motion/motion.h
+--- linuxcnc.orig/src/emc/motion/motion.h	2020-01-02 20:02:01.000000000 +0100
++++ linuxcnc/src/emc/motion/motion.h	2020-01-17 10:02:25.647094649 +0100
+@@ -458,6 +458,7 @@
+ #define HOME_USE_INDEX		2
+ #define HOME_IS_SHARED		4
+ #define HOME_UNLOCK_FIRST       8
++#define HOME_IS_ABSOLUTE        16
+ 
+ /* flags for enabling spindle scaling, feed scaling,
+    adaptive feed, and feed hold */
+diff -Naur linuxcnc.orig/src/emc/nml_intf/emc.hh linuxcnc/src/emc/nml_intf/emc.hh
+--- linuxcnc.orig/src/emc/nml_intf/emc.hh	2020-01-02 20:02:01.000000000 +0100
++++ linuxcnc/src/emc/nml_intf/emc.hh	2020-01-17 10:02:25.647094649 +0100
+@@ -387,7 +387,8 @@
+ extern int emcAxisSetHomingParams(int axis, double home, double offset, double home_final_vel,
+ 				  double search_vel, double latch_vel,
+ 				  int use_index, int ignore_limits,
+-				  int is_shared, int home_sequence, int volatile_home, int locking_indexer);
++				  int is_shared, int is_absolute,
++				  int home_sequence, int volatile_home, int locking_indexer);
+ extern int emcAxisSetMaxVelocity(int axis, double vel);
+ extern int emcAxisSetMaxAcceleration(int axis, double acc);
+ 
+diff -Naur linuxcnc.orig/src/emc/nml_intf/emc_nml.hh linuxcnc/src/emc/nml_intf/emc_nml.hh
+--- linuxcnc.orig/src/emc/nml_intf/emc_nml.hh	2020-01-17 10:02:20.035035646 +0100
++++ linuxcnc/src/emc/nml_intf/emc_nml.hh	2020-01-17 10:02:25.647094649 +0100
+@@ -265,6 +265,7 @@
+     int use_index;
+     int ignore_limits;
+     int is_shared;
++    int is_absolute;
+     int home_sequence;
+     int volatile_home;
+     int locking_indexer;
+diff -Naur linuxcnc.orig/src/emc/task/emctaskmain.cc linuxcnc/src/emc/task/emctaskmain.cc
+--- linuxcnc.orig/src/emc/task/emctaskmain.cc	2020-01-17 10:02:20.039035687 +0100
++++ linuxcnc/src/emc/task/emctaskmain.cc	2020-01-17 10:02:25.647094649 +0100
+@@ -1722,6 +1722,7 @@
+ 					set_homing_params_msg->use_index,
+ 					set_homing_params_msg->ignore_limits,
+ 					set_homing_params_msg->is_shared,
++					set_homing_params_msg->is_absolute,
+ 					set_homing_params_msg->home_sequence,
+ 					set_homing_params_msg->volatile_home,
+                                         set_homing_params_msg->locking_indexer);
+diff -Naur linuxcnc.orig/src/emc/task/taskintf.cc linuxcnc/src/emc/task/taskintf.cc
+--- linuxcnc.orig/src/emc/task/taskintf.cc	2020-01-02 20:02:01.000000000 +0100
++++ linuxcnc/src/emc/task/taskintf.cc	2020-01-17 10:02:25.647094649 +0100
+@@ -236,7 +236,7 @@
+ 
+ int emcAxisSetHomingParams(int axis, double home, double offset, double home_final_vel,
+ 			   double search_vel, double latch_vel,
+-			   int use_index, int ignore_limits, int is_shared,
++			   int use_index, int ignore_limits, int is_shared, int is_absolute,
+ 			   int sequence,int volatile_home, int locking_indexer)
+ {
+ #ifdef ISNAN_TRAP
+@@ -270,6 +270,9 @@
+     if (is_shared) {
+ 	emcmotCommand.flags |= HOME_IS_SHARED;
+     }
++    if (is_absolute) {
++	emcmotCommand.flags |= HOME_IS_ABSOLUTE;
++    }
+     if (locking_indexer) {
+         emcmotCommand.flags |= HOME_UNLOCK_FIRST;
+     }
